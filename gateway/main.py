@@ -15,11 +15,12 @@ app.add_middleware(
 )
 
 STAGE_URLS = {
-    "0B": os.environ.get("STAGE_0B_URL", ""),
-    "1":  os.environ.get("STAGE_1_URL",  ""),
-    "2":  os.environ.get("STAGE_2_URL",  ""),
-    "3B": os.environ.get("STAGE_3B_URL", ""),
-    "4":  os.environ.get("STAGE_4_URL",  ""),
+    "0B": os.environ.get("STAGE_0B_URL",  ""),
+    "1":  os.environ.get("STAGE_1_URL",   ""),
+    "2":  os.environ.get("STAGE_2_URL",   ""),
+    "3A": os.environ.get("STAGE_3A_URL",  ""),
+    "3B": os.environ.get("STAGE_3B_URL",  ""),
+    "4":  os.environ.get("STAGE_4_URL",   ""),
 }
 
 validate_master = get_api_key_validator("GATEWAY")
@@ -45,7 +46,11 @@ async def proxy(stage: str, path: str, payload: dict) -> dict:
 async def health():
     return {
         "status": "ok",
-        "stages": {k: "configured" if v else "not configured" for k, v in STAGE_URLS.items()},
+        "pipeline": "0b → 1 → 2 → 3a → 3b → 4 → 5 → 6 → 7 → 8 → 9 → 10",
+        "stages": {
+            k: "configured" if v else "not configured"
+            for k, v in STAGE_URLS.items()
+        },
     }
 
 
@@ -62,6 +67,11 @@ async def stage1_normalise(request: Request, _=Depends(validate_master)):
 @app.post("/stage2/embed")
 async def stage2_embed(request: Request, _=Depends(validate_master)):
     return await proxy("2", "embed", await request.json())
+
+
+@app.post("/stage3a/extract")
+async def stage3a_extract(request: Request, _=Depends(validate_master)):
+    return await proxy("3A", "extract", await request.json())
 
 
 @app.post("/stage3b/score")
