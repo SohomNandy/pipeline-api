@@ -3,3 +3,5 @@ torch-geometric
 pandas 
 pyarrow 
 numpy
+fastapi
+uvicorn[standard]
