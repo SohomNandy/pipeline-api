@@ -113,78 +113,72 @@ def load_model_weights(model: TemporalGRU) -> bool:
 )
 class TemporalGRUPredictor:
     def __enter__(self):
+        import torch
+        import torch.nn as nn
+        from huggingface_hub import hf_hub_download, HfHubHTTPError
+
+        # ── Model definition ───────────────────────────────────────────────────
+        class TemporalGRU(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gru = nn.GRU(INPUT_DIM, HIDDEN_DIM, batch_first=True)
+                self.dropout = nn.Dropout(DROPOUT)
+                self.linear = nn.Linear(HIDDEN_DIM, 1)
+
+            def forward(self, x):
+                gru_out, h_n = self.gru(x)
+                h_n = h_n.squeeze(0)
+                dropped = self.dropout(gru_out)
+                pred = self.linear(dropped).squeeze(-1)
+                return torch.sigmoid(pred), h_n
+
+        # ── Load weights with FALLBACK (CRITICAL FIX) ──────────────────────────
         self.model = TemporalGRU()
-        self.has_trained_weights = load_model_weights(self.model)
-        self.model.eval()
-
-        groq_key = os.getenv("GROQ_API_KEY", "")
-        self.groq_client = Groq(api_key=groq_key) if groq_key else None
-        self.groq_available = self.groq_client is not None
-
-    @modal.method()
-    def predict(self, h_v: List[List[float]], n_timesteps: int = DEFAULT_T, include_analysis: bool = False) -> dict:
-        x = torch.tensor(h_v, dtype=torch.float32)
-        x = x.unsqueeze(1).expand(-1, n_timesteps, -1)
-
-        with torch.no_grad():
-            preds, final_h = self.model(x)
-
-        preds_list = preds.tolist()
-        final_h_list = final_h.tolist()
-
-        analysis = None
-        if include_analysis and self.groq_available:
-            batch_meta = [
-                {"idx": i, "max_prob": float(max(preds_list[i])), "h_norm": float(torch.norm(torch.tensor(final_h_list[i])))}
-                for i in range(len(h_v))
-            ]
-            analysis = self._groq_analyze(batch_meta)
-        elif include_analysis:
-            analysis = ["Groq analysis skipped: GROQ_API_KEY not configured."] * len(h_v)
-
-        return {
-            "next_step_predictions": preds_list,
-            "final_hidden": final_h_list,
-            "n_nodes": len(h_v),
-            "n_timesteps": n_timesteps,
-            "analysis": analysis,
-            "weights_status": "trained" if self.has_trained_weights else "random_init"
-        }
-
-    def _groq_analyze(self, batch_data: List[Dict[str, Any]]) -> List[str]:
-        def _worker(data: Dict[str, Any]) -> str:
-            prompt = (
-                f"Node {data['idx']} temporal risk profile:\n"
-                f"Peak compromise probability: {data['max_prob']:.4f}\n"
-                f"Final hidden state L2 norm: {data['h_norm']:.4f}\n"
-                f"Provide: 1) Risk level (Low/Med/High/Critical) 2) One-sentence mitigation recommendation."
+        weights_loaded = False
+        
+        # Try 1: HuggingFace
+        try:
+            print(f"Attempting HF download: {REPO_ID}/{MODEL_FILE}...")
+            ckpt_path = hf_hub_download(
+                repo_id=REPO_ID,
+                filename=MODEL_FILE,
+                token=os.environ.get("HF_TOKEN")
             )
-            for attempt in range(4):
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            self.model.load_state_dict(state_dict)
+            print("✓ Loaded trained weights from HuggingFace")
+            weights_loaded = True
+        except (HfHubHTTPError, FileNotFoundError, RuntimeError) as e:
+            print(f"⚠ HF download failed: {e}")
+        
+        # Try 2: Local path
+        if not weights_loaded:
+            local_path = os.getenv("WEIGHTS_PATH", "stage7_gru_weights.pt")
+            if os.path.exists(local_path):
                 try:
-                    resp = self.groq_client.chat.completions.create(
-                        model=GROQ_MODEL,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=150, temperature=0.2, timeout=10.0
-                    )
-                    return resp.choices[0].message.content.strip()
+                    ckpt = torch.load(local_path, map_location="cpu", weights_only=True)
+                    state_dict = ckpt.get("model_state_dict", ckpt)
+                    self.model.load_state_dict(state_dict)
+                    print(f"✓ Loaded weights from local: {local_path}")
+                    weights_loaded = True
                 except Exception as e:
-                    if "rate_limit" in str(e).lower() or "429" in str(e):
-                        wait = (2 ** attempt) + random.uniform(0, 1.5)
-                        time.sleep(wait)
-                    else:
-                        return f"Analysis failed: {str(e)}"
-            return "Analysis failed: exhausted retries"
+                    print(f"⚠ Local load failed: {e}")
+        
+        # Try 3: Random initialization (for testing)
+        if not weights_loaded:
+            print("⚠️ WARNING: No trained weights found. Using random initialization.")
+            print("⚠️ Predictions will be meaningless until weights are loaded.")
+            print("💡 Train the model or upload model_GRU.pt to HuggingFace.")
+        
+        self.model.eval()
+        self.weights_loaded = weights_loaded  # Track for health checks
 
-        results = [None] * len(batch_data)
-        with ThreadPoolExecutor(max_workers=MAX_GROQ_WORKERS) as executor:
-            future_to_idx = {executor.submit(_worker, item): i for i, item in enumerate(batch_data)}
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = f"Analysis failed: {str(e)}"
-        return results
+        # ── Groq client ───────────────────────────────────────────────────────
+        from groq import Groq
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        self.groq_client = Groq(api_key=groq_key) if groq_key else None
+        self.groq_available = bool(groq_key)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI WRAPPER
@@ -229,7 +223,8 @@ def fastapi_app():
             "status": "ok",
             "model": f"{REPO_ID}/{MODEL_FILE}",
             "groq_model": GROQ_MODEL,
-            "weights_loaded": predictor.has_trained_weights
+            "weights_loaded": predictor.weights_loaded,  # NEW
+            "gpu": "T4" if GPU_CONFIG else "CPU"
         }
 
     @web.post("/predict", response_model=PredictResponse)
