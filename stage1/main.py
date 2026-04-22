@@ -16,12 +16,12 @@ import os
 import secrets as _secrets
 import hashlib
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
@@ -185,6 +185,32 @@ def _classify(fields: dict, raw: dict):
     return event_type, risk_level
 
 
+def _process_single(provider: str, raw_log: dict) -> dict:
+    """Process a single log and return the response dict"""
+    if provider == "AWS":
+        fields = _extract_aws(raw_log)
+    elif provider == "Azure":
+        fields = _extract_azure(raw_log)
+    else:
+        fields = _extract_gcp(raw_log)
+
+    event_type, risk_level = _classify(fields, raw_log)
+
+    return {
+        "entity_id": fields["entity_id"],
+        "entity_type": fields["entity_type"],
+        "action": fields["action"],
+        "target_id": fields["target_id"],
+        "target_type": fields["target_type"],
+        "source_ip": fields["source_ip"],
+        "region": fields["region"],
+        "cloud_account": fields["cloud_account"],
+        "status": fields["status"],
+        "event_type": event_type,
+        "risk_level": risk_level,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -208,6 +234,16 @@ class NormaliseResponse(BaseModel):
     event_type:    str
     risk_level:    str
 
+class BatchNormaliseRequest(BaseModel):
+    events: List[NormaliseRequest] = Field(..., max_items=100, description="Max 100 logs per batch")
+
+class BatchNormaliseResponse(BaseModel):
+    total: int
+    successful: int
+    failed: int
+    results: List[dict]
+
+
 @app.get("/health")
 def health():
     return {
@@ -215,7 +251,10 @@ def health():
         "status":           "ok",
         "model":            "rule-based (no ML — fits Render 512MB)",
         "memory_footprint": "~50MB",
+        "batch_supported":  True,
+        "max_batch_size":   100,
     }
+
 
 @app.post("/normalise", response_model=NormaliseResponse)
 def normalise(req: NormaliseRequest, _=Depends(validate)):
@@ -224,21 +263,54 @@ def normalise(req: NormaliseRequest, _=Depends(validate)):
             status_code=400,
             detail=f"Invalid provider '{req.provider}'. Must be AWS, Azure, or GCP.",
         )
+    
+    try:
+        return NormaliseResponse(**_process_single(req.provider, req.raw_log))
+    except Exception as e:
+        log.error(f"Error processing log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    if req.provider == "AWS":
-        fields = _extract_aws(req.raw_log)
-    elif req.provider == "Azure":
-        fields = _extract_azure(req.raw_log)
-    else:
-        fields = _extract_gcp(req.raw_log)
 
-    event_type, risk_level = _classify(fields, req.raw_log)
-
-    return NormaliseResponse(
-        **fields,
-        event_type=event_type,
-        risk_level=risk_level,
+@app.post("/normalise_batch", response_model=BatchNormaliseResponse)
+def normalise_batch(req: BatchNormaliseRequest, _=Depends(validate)):
+    """
+    Batch endpoint - processes up to 100 logs in one request.
+    This reduces the number of HTTP requests and prevents Render timeouts.
+    """
+    results = []
+    successful = 0
+    failed = 0
+    
+    for event in req.events:
+        if event.provider not in ("AWS", "Azure", "GCP"):
+            results.append({
+                "error": f"Invalid provider '{event.provider}'",
+                "entity_id": "",
+                "action": "",
+            })
+            failed += 1
+            continue
+        
+        try:
+            result = _process_single(event.provider, event.raw_log)
+            results.append(result)
+            successful += 1
+        except Exception as e:
+            log.error(f"Batch processing error: {e}")
+            results.append({
+                "error": str(e),
+                "entity_id": "",
+                "action": "",
+            })
+            failed += 1
+    
+    return BatchNormaliseResponse(
+        total=len(req.events),
+        successful=successful,
+        failed=failed,
+        results=results,
     )
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
