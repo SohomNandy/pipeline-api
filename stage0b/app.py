@@ -1,15 +1,20 @@
-import modal, os, json, torch, asyncio, time, hashlib, secrets
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, Security, Depends, BackgroundTasks
-from fastapi.security.api_key import APIKeyHeader
-from collections import Counter
-import random
-import numpy as np
+"""
+Stage 0b — SIEM Log Generator
+Model: sohomn/siem-log-generator-llama31-8b (LLaMA 3.1 8B + QLoRA)
+Platform: Modal GPU T4
+Input:  structured event dict (provider, action, entity_id, ...)
+Output: provider-native JSON log with _pipeline_meta field
+"""
 
-# ============================================================
-# MODAL IMAGE (no extra ML deps – sampling uses built-ins)
-# ============================================================
+import modal, os, json
+from typing import List
+import hashlib
+import secrets as _secrets
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODAL IMAGE + APP
+# ══════════════════════════════════════════════════════════════════════════════
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -22,6 +27,7 @@ image = (
         "fastapi",
         "uvicorn",
         "pydantic==2.7.0",
+        "tenacity>=8.2.0",
     )
 )
 
@@ -35,134 +41,98 @@ SYSTEM_PROMPT = (
     'The JSON must include a "_pipeline_meta" field.'
 )
 
-# ============================================================
-# LIGHTWEIGHT SAMPLER (no pandas/sklearn/sentence-transformers)
-# ============================================================
-class LightweightSampler:
-    """Smart sampling using only built-in Python – runs inside Modal"""
-    
-    @staticmethod
-    def temporal_sample(events: List[dict], timestep_key='t', scenario_key='scenario_id'):
-        """Keep early, peak, and late timesteps per scenario"""
-        by_scenario = {}
-        for e in events:
-            sid = e.get(scenario_key, 'default')
-            by_scenario.setdefault(sid, []).append(e)
-        
-        sampled = []
-        for sid, evts in by_scenario.items():
-            # Group by timestep
-            by_t = {}
-            for e in evts:
-                t = e.get(timestep_key, 0)
-                by_t.setdefault(t, []).append(e)
-            
-            timesteps = sorted(by_t.keys())
-            if len(timesteps) <= 10:
-                sampled.extend(evts)
-                continue
-            
-            # Early (first 3 timesteps)
-            for t in timesteps[:3]:
-                sampled.extend(by_t[t])
-            
-            # Peak (timestep with most malicious)
-            malicious_counts = {}
-            for t, evt_list in by_t.items():
-                mal_count = sum(1 for e in evt_list if e.get('malicious', 0) == 1)
-                malicious_counts[t] = mal_count
-            if malicious_counts:
-                peak_t = max(malicious_counts, key=malicious_counts.get)
-                sampled.extend(by_t[peak_t])
-            
-            # Late (last 3 timesteps)
-            for t in timesteps[-3:]:
-                sampled.extend(by_t[t])
-        
-        return sampled
-    
-    @staticmethod
-    def phase_balanced_sample(events: List[dict], phase_key='attack_phase', target_per_phase=30):
-        """Ensure rare phases are oversampled (simple duplication)"""
-        by_phase = {}
-        for e in events:
-            phase = e.get(phase_key, 'benign')
-            by_phase.setdefault(phase, []).append(e)
-        
-        sampled = []
-        for phase, evts in by_phase.items():
-            if len(evts) < target_per_phase and len(evts) > 0:
-                # Oversample with duplication
-                n_copies = (target_per_phase // len(evts)) + 1
-                for _ in range(n_copies):
-                    sampled.extend(evts)
-                sampled = sampled[:target_per_phase]
-            else:
-                sampled.extend(evts)
-        
-        return sampled
-    
-    @staticmethod
-    def provider_balanced_sample(events: List[dict], provider_key='provider', min_per_provider=30):
-        """Ensure each cloud provider is represented"""
-        by_provider = {}
-        for e in events:
-            prov = e.get(provider_key, 'AWS')
-            by_provider.setdefault(prov, []).append(e)
-        
-        sampled = []
-        for prov, evts in by_provider.items():
-            if len(evts) < min_per_provider and len(evts) > 0:
-                # Oversample with replacement
-                n_needed = min_per_provider - len(evts)
-                sampled.extend(evts)
-                for _ in range(n_needed):
-                    sampled.append(random.choice(evts))
-            else:
-                sampled.extend(evts)
-        
-        return sampled
-    
-    @staticmethod
-    def sample(events: List[dict], target_size: int = 2000) -> List[dict]:
-        """Run all sampling strategies in sequence"""
-        if len(events) <= target_size:
-            return events
-        
-        # Step 1: Temporal sampling
-        sampled = LightweightSampler.temporal_sample(events)
-        
-        # Step 2: Phase balancing
-        sampled = LightweightSampler.phase_balanced_sample(sampled)
-        
-        # Step 3: Provider balancing
-        sampled = LightweightSampler.provider_balanced_sample(sampled)
-        
-        # Step 4: Final random sample to target size
-        if len(sampled) > target_size:
-            sampled = random.sample(sampled, target_size)
-        
-        return sampled
+# ── Provider-aware fallback templates ────────────────────────────────────────
+# These are used when LLM generation fails. Each matches the provider's native
+# log structure so downstream provider detection works correctly.
+
+def _fallback_log(event: dict) -> dict:
+    """
+    Build a minimal but structurally correct provider-native fallback log.
+    Each provider template uses the real field names for that cloud so that
+    field-sniffing in task_stage0b works as a secondary detection method.
+    """
+    provider = event.get('provider', 'AWS')
+    meta = {
+        'edge_id':      event.get('edge_id',      ''),
+        'scenario_id':  event.get('scenario_id',  ''),
+        't':            event.get('t',             0),
+        'malicious':    event.get('malicious',     0),
+        'attack_phase': event.get('attack_phase',  'benign'),
+        'provider':     provider,   # ← always stamped — primary detection signal
+        'fallback':     True,
+    }
+
+    if provider == 'AWS':
+        return {
+            'eventVersion':   '1.08',
+            'eventSource':    'iam.amazonaws.com',          # AWS field — detectable
+            'eventName':      event.get('action', 'AssumeRole'),
+            'awsRegion':      event.get('region', 'us-east-1'),
+            'sourceIPAddress':event.get('source_ip', '0.0.0.0'),
+            'userIdentity':   {'userName': event.get('entity_id', 'unknown')},
+            'requestParameters': {'roleArn': event.get('target_id', '')},
+            'responseElements':  {'assumedRoleUser': {'arn': ''}},
+            '_pipeline_meta': meta,
+        }
+
+    elif provider == 'Azure':
+        return {
+            'operationName':  event.get('action', 'Microsoft.Compute/virtualMachines/read'),
+            'subscriptionId': event.get('cloud_account', 'sub-00000000'),  # Azure field
+            'resourceGroup':  'rg-default',
+            'resourceId':     f"/subscriptions/{event.get('cloud_account','')}/providers/Microsoft.Compute",
+            'callerIpAddress':event.get('source_ip', '0.0.0.0'),
+            'identity':       {'authorization': {'evidence': {'principalId': event.get('entity_id','')}}},
+            'properties':     {'targetId': event.get('target_id', '')},
+            'status':         {'value': event.get('status', 'Succeeded')},
+            '_pipeline_meta': meta,
+        }
+
+    else:  # GCP
+        return {
+            'protoPayload': {                               # GCP field — detectable
+                '@type':         'type.googleapis.com/google.cloud.audit.AuditLog',
+                'serviceName':   'compute.googleapis.com',
+                'methodName':    event.get('action', 'v1.compute.instances.get'),
+                'authenticationInfo': {'principalEmail': event.get('entity_id', 'unknown@project.iam')},
+                'requestMetadata':    {'callerIp': event.get('source_ip', '0.0.0.0')},
+                'resourceName':       event.get('target_id', ''),
+            },
+            'resource': {
+                'type':   'gce_instance',
+                'labels': {'project_id': event.get('cloud_account', 'gcp-project')},
+            },
+            'timestamp':      '2024-01-01T00:00:00Z',
+            'severity':       'INFO',
+            '_pipeline_meta': meta,
+        }
 
 
-# ============================================================
-# MODAL CLASS (SIEM Generator)
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# SIEM GENERATOR CLASS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @app.cls(
     gpu="T4",
     secrets=[modal.Secret.from_name("siem-pipeline-secrets")],
     container_idle_timeout=300,
-    allow_concurrent_inputs=10,
+    allow_concurrent_inputs=5,
 )
 class SIEMGenerator:
+
     def __enter__(self):
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
         from peft import PeftModel
         from huggingface_hub import login as hf_login
+        import torch
 
-        hf_login(token=os.environ["HF_TOKEN"])
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            hf_login(token=hf_token)
+        else:
+            print("WARNING: HF_TOKEN not set — model loading may fail for gated repos")
 
-        BASE_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        BASE_ID    = "meta-llama/Meta-Llama-3.1-8B-Instruct"
         ADAPTER_ID = "sohomn/siem-log-generator-llama31-8b"
 
         bnb = BitsAndBytesConfig(
@@ -171,10 +141,13 @@ class SIEMGenerator:
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
         )
+
+        print(f"Loading tokenizer from {BASE_ID}...")
         self.tokenizer = AutoTokenizer.from_pretrained(BASE_ID, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        print(f"Loading base model {BASE_ID}...")
         base = AutoModelForCausalLM.from_pretrained(
             BASE_ID,
             quantization_config=bnb,
@@ -183,216 +156,210 @@ class SIEMGenerator:
             trust_remote_code=True,
             attn_implementation="eager",
         )
+
+        print(f"Loading LoRA adapter {ADAPTER_ID}...")
         self.model = PeftModel.from_pretrained(base, ADAPTER_ID, is_trainable=False)
         self.model.eval()
 
+        print("Warming up...")
+        self._generate_single({"provider": "AWS", "action": "TEST",
+                                "entity_id": "warmup", "scenario_id": "warmup"})
+        print("Stage 0b ready ✓")
+
+    def _generate_single(self, event: dict, max_retries: int = 2) -> dict:
+        import torch, warnings
+        from tenacity import (retry, stop_after_attempt,
+                              wait_exponential, retry_if_exception_type)
+
+        @retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+            retry=retry_if_exception_type(Exception),
+        )
+        def _gen():
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": json.dumps(event)},
+            ]
+            text   = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+
+            with torch.no_grad(), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    temperature=0.0,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    repetition_penalty=1.0,
+                )
+
+            response = self.tokenizer.decode(
+                out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            ).strip()
+
+            j0 = response.find("{")
+            j1 = response.rfind("}") + 1
+            if j0 < 0 or j1 <= 0:
+                raise ValueError(f"No JSON in response: {response[:200]}")
+
+            json_str = (response[j0:j1]
+                        .replace("'", '"')
+                        .replace("None", "null")
+                        .replace("True", "true")
+                        .replace("False", "false"))
+            parsed = json.loads(json_str)
+
+            # Ensure _pipeline_meta is always present and has correct provider
+            if "_pipeline_meta" not in parsed:
+                parsed["_pipeline_meta"] = {}
+            parsed["_pipeline_meta"].update({
+                "edge_id":      event.get("edge_id",      ""),
+                "scenario_id":  event.get("scenario_id",  ""),
+                "t":            event.get("t",             0),
+                "malicious":    event.get("malicious",     0),
+                "attack_phase": event.get("attack_phase",  "benign"),
+                "provider":     event.get("provider",      "AWS"),  # ← stamp input provider
+            })
+            return {"log": parsed}
+
+        try:
+            return _gen()
+        except Exception as e:
+            print(f"Generation failed after {max_retries} retries: {e} — using fallback")
+            return {"log": _fallback_log(event), "warning": str(e)[:100]}
+
     @modal.method()
     def generate(self, event: dict) -> dict:
-        import warnings
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(event)},
-        ]
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
-        with torch.no_grad(), warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        response = self.tokenizer.decode(
-            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
-        j0, j1 = response.find("{"), response.rfind("}") + 1
-        if j0 < 0:
-            return {"error": "no JSON in output", "raw": response[:200]}
-        try:
-            return {"log": json.loads(response[j0:j1])}
-        except Exception as e:
-            return {"error": str(e), "raw": response[j0:j1]}
+        return self._generate_single(event)
 
     @modal.method()
     def generate_batch(self, events: List[dict]) -> List[dict]:
         results = []
         for event in events:
-            results.append(self.generate(event))
+            try:
+                results.append(self._generate_single(event))
+            except Exception as e:
+                # Isolate — one bad event must not crash the whole batch
+                results.append({"log": _fallback_log(event), "error": str(e)})
         return results
-    
-    @modal.method()
-    def generate_with_sampling(self, events: List[dict], target_size: int = 2000) -> List[dict]:
-        """Smart sampling + generation in one call"""
-        sampled_events = LightweightSampler.sample(events, target_size)
-        return self.generate_batch(sampled_events)
 
 
-# ============================================================
-# FASTAPI APP
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# FASTAPI WRAPPER
+# ══════════════════════════════════════════════════════════════════════════════
+
 @app.function(
     gpu="T4",
     secrets=[modal.Secret.from_name("siem-pipeline-secrets")],
     container_idle_timeout=300,
-    allow_concurrent_inputs=10,
+    allow_concurrent_inputs=5,
+    memory=16384,
 )
 @modal.asgi_app()
 def fastapi_app():
-    web = FastAPI(title="Stage 0b - SIEM Log Generator")
+    from fastapi import FastAPI, HTTPException, Security, Depends
+    from fastapi.responses import JSONResponse
+    from fastapi.security.api_key import APIKeyHeader
+    from pydantic import BaseModel, Field
+    from contextlib import asynccontextmanager
+
     API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
     def validate(api_key: str = Security(API_KEY_HEADER)):
         expected = os.environ.get("STAGE_0B_API_KEY", "")
-        if not api_key or not secrets.compare_digest(
+        if not api_key or not _secrets.compare_digest(
             hashlib.sha256(api_key.encode()).hexdigest(),
             hashlib.sha256(expected.encode()).hexdigest(),
         ):
             raise HTTPException(status_code=403, detail="Invalid API key")
         return api_key
 
+    @asynccontextmanager
+    async def lifespan(app):
+        print("Stage 0b FastAPI starting...")
+        yield
+
+    web       = FastAPI(title="Stage 0b — SIEM Log Generator", lifespan=lifespan)
     generator = SIEMGenerator()
 
-    # ----- Request/Response Models -----
     class GenerateRequest(BaseModel):
-        provider: str
-        action: str
-        entity_id: str
-        target_id: str = ""
-        source_ip: str = ""
-        region: str = "us-east-1"
+        provider:      str
+        action:        str
+        entity_id:     str
+        target_id:     str = ""
+        source_ip:     str = ""
+        region:        str = "us-east-1"
         cloud_account: str = ""
-        status: str = "Success"
-        malicious: int = 0
-        attack_phase: str = "benign"
-        edge_id: str = ""
-        scenario_id: str = ""
-        t: int = 0
+        status:        str = "Success"
+        malicious:     int = 0
+        attack_phase:  str = "benign"
+        edge_id:       str = ""
+        scenario_id:   str = ""
+        t:             int = 0
 
     class BatchGenerateRequest(BaseModel):
-        events: List[GenerateRequest] = Field(..., max_items=200)
-        apply_sampling: bool = Field(False, description="Apply smart sampling before generation")
-        target_size: int = Field(2000, ge=100, le=5000)
+        events:      List[GenerateRequest] = Field(..., max_length=2000)
+        scenario_id: str = ""
 
-    class BatchStatusResponse(BaseModel):
-        batch_id: str
-        status: str
-        total: int
-        completed: int
-        failed: int
-        results: Optional[List[dict]] = None
-
-    # Simple in-memory store for async batches
-    batch_store: Dict[str, dict] = {}
-
-    # ----- Endpoints -----
     @web.get("/health")
     async def health():
         return {
-            "stage": "0b",
-            "status": "ok",
-            "model": "sohomn/siem-log-generator-llama31-8b",
+            "stage":           "0b",
+            "status":          "ok",
+            "model":           "sohomn/siem-log-generator-llama31-8b",
             "batch_supported": True,
-            "sampling_supported": True,
-            "max_batch_size": 200
+            "max_batch_size":  50,
         }
 
     @web.get("/")
     async def root():
         return {
-            "service": "Stage 0b - SIEM Log Generator",
+            "service":   "Stage 0b — SIEM Log Generator",
             "endpoints": {
-                "GET /health": "Health check",
-                "POST /generate": "Generate single log",
-                "POST /generate_batch": "Generate batch (sync)",
-                "POST /generate_batch_async": "Generate batch (async)",
-                "POST /generate_with_sampling": "Smart sampling + generation"
-            }
+                "POST /generate":       "Generate single log",
+                "POST /generate_batch": "Generate batch of logs (max 50)",
+                "GET  /health":         "Health check",
+            },
         }
 
     @web.post("/generate")
     async def generate(req: GenerateRequest, _=Depends(validate)):
-        result = generator.generate.remote(req.dict())
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result)
-        return result
+        try:
+            result = generator.generate.remote(req.dict())
+            if "error" in result and not result.get("log"):
+                raise HTTPException(status_code=500, detail=result["error"])
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
     @web.post("/generate_batch")
     async def generate_batch(req: BatchGenerateRequest, _=Depends(validate)):
-        events_dict = [e.dict() for e in req.events]
-        
-        if req.apply_sampling:
-            results = generator.generate_with_sampling.remote(events_dict, req.target_size)
-        else:
-            results = generator.generate_batch.remote(events_dict)
-        
-        return {
-            "total": len(results),
-            "successful": sum(1 for r in results if "error" not in r),
-            "failed": sum(1 for r in results if "error" in r),
-            "results": results
-        }
-
-    @web.post("/generate_batch_async")
-    async def generate_batch_async(
-        req: BatchGenerateRequest,
-        background_tasks: BackgroundTasks,
-        _=Depends(validate)
-    ):
-        batch_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
-        
-        batch_store[batch_id] = {
-            "status": "processing",
-            "total": len(req.events),
-            "completed": 0,
-            "failed": 0,
-            "results": None
-        }
-        
-        async def process():
+        try:
             events_dict = [e.dict() for e in req.events]
-            if req.apply_sampling:
-                results = generator.generate_with_sampling.remote(events_dict, req.target_size)
-            else:
-                results = generator.generate_batch.remote(events_dict)
-            
-            batch_store[batch_id] = {
-                "status": "completed",
-                "total": len(results),
-                "completed": sum(1 for r in results if "error" not in r),
-                "failed": sum(1 for r in results if "error" in r),
-                "results": results
+            # Override scenario_id on each event if provided at batch level
+            if req.scenario_id:
+                for e in events_dict:
+                    if not e.get('scenario_id'):
+                        e['scenario_id'] = req.scenario_id
+            results  = generator.generate_batch.remote(events_dict)
+            failures = sum(1 for r in results if "error" in r)
+            return {
+                "total":      len(results),
+                "successful": len(results) - failures,
+                "failed":     failures,
+                "results":    results,
             }
-        
-        background_tasks.add_task(process)
-        
-        return {
-            "batch_id": batch_id,
-            "status": "processing",
-            "message": "Batch processing started. GET /batch_status/{batch_id}",
-            "total": len(req.events)
-        }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Batch generation failed: {e}")
 
-    @web.post("/generate_with_sampling")
-    async def generate_with_sampling(req: BatchGenerateRequest, _=Depends(validate)):
-        """One-shot: smart sampling + generation, returns results"""
-        events_dict = [e.dict() for e in req.events]
-        results = generator.generate_with_sampling.remote(events_dict, req.target_size)
-        
-        return {
-            "original_count": len(req.events),
-            "sampled_count": len(results),
-            "successful": sum(1 for r in results if "error" not in r),
-            "failed": sum(1 for r in results if "error" in r),
-            "results": results
-        }
-
-    @web.get("/batch_status/{batch_id}")
-    async def batch_status(batch_id: str, _=Depends(validate)):
-        if batch_id not in batch_store:
-            raise HTTPException(status_code=404, detail="Batch not found")
-        return batch_store[batch_id]
+    @web.exception_handler(Exception)
+    async def global_exc(request, exc):
+        return JSONResponse(status_code=500,
+                            content={"detail": f"Stage 0b error: {exc}"})
 
     return web
