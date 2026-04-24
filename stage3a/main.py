@@ -22,7 +22,6 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import torch
-import peft
 import uvicorn
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
