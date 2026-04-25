@@ -337,6 +337,7 @@ import os
 import secrets as _secrets
 import hashlib
 import logging
+import re  # ✅ ADD THIS IMPORT
 from typing import List, Optional
 
 import uvicorn
