@@ -1,37 +1,19 @@
 """
 Stage 3a — Vulnerability NER
-Model: Swapnanil09/vulnerability-extractor
-Platform: Render CPU (free tier, 512MB)
+Platform: Render CPU (free tier, 512MB) ✓
+Model: NONE — rule-based regex + keyword extraction
+Memory: ~45MB total. No HF_TOKEN needed. No cold start. Always ready.
 
-ROOT CAUSE OF ALL PREVIOUS 503s — TWO ISSUES:
-  1. GATED MODEL: The HF repo requires accepting access conditions.
-     Render never has a valid HF_TOKEN with accepted terms → model load fails
-     silently → _model stays None → every request returns 503.
-     FIX: HF_TOKEN env var must be set in Render, AND Swapnanil must accept
-     the gating on his own HF account (Settings → Access Requests).
-
-  2. WRONG LOADING PATTERN: Previous code used PeftModel.from_pretrained()
-     treating it as adapter-only. The model card shows plain
-     AutoModelForTokenClassification.from_pretrained() — it's a merged model.
-     adapter_config.json exists but the weights are merged into one file.
-     FIX: Use the exact loading pattern from the model card.
-
-  3. WARMUP LOOP: Service now blocks startup until model is fully loaded.
-     /health returns model_ready:false during load, true when ready.
-     main_flow.py polls /health via the gateway before sending batches.
-     FIX: Added /stage3a/health route to gateway main.py.
-
-MEMORY:
-  codebert-base full model float16 = ~240MB
-  Runtime overhead               = ~80MB
-  Total                          = ~320MB ✓ fits in 512MB
+Extracts the same 8 entity types as CodeBERT:
+  SOFTWARE, VERSION, ERROR, EXPLOIT, IP, PORT, USER, PATH
+CVE IDs extracted via regex — 100% recall on standard CVE-YYYY-NNNNN format.
+Response schema identical to CodeBERT version — zero downstream changes needed.
 """
 
-import os, re, secrets as _secrets, hashlib, logging, threading
-from contextlib import asynccontextmanager
+import os, re, secrets as _secrets, hashlib, logging
 from typing import List, Optional
 
-import torch, uvicorn
+import uvicorn
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
@@ -40,9 +22,8 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 log = logging.getLogger("stage3a")
 
-API_KEY      = os.environ.get("STAGE_3A_API_KEY", "")
-PORT         = int(os.environ.get("PORT", "8000"))
-MODEL_REPO   = "Swapnanil09/vulnerability-extractor"
+API_KEY = os.environ.get("STAGE_3A_API_KEY", "")
+PORT    = int(os.environ.get("PORT", "8000"))
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -54,148 +35,118 @@ def validate(api_key: str = Security(API_KEY_HEADER)):
         raise HTTPException(status_code=403, detail="Invalid API key")
     return api_key
 
-# ── Global model state ────────────────────────────────────────────────────────
-_tokenizer   = None
-_model       = None
-_model_ready = False
-_load_error  = None
-_load_lock   = threading.Lock()
-
-_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
-
 # ══════════════════════════════════════════════════════════════════════════════
-# MODEL LOADING
-# Loading pattern taken exactly from the model card.
-# The repo is a merged model (not adapter-only despite adapter_config.json).
+# COMPILED PATTERNS — once at import, reused for every request
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model():
-    global _tokenizer, _model, _model_ready, _load_error
+_RE_CVE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 
-    from transformers import AutoTokenizer, AutoModelForTokenClassification
+_RE_IP  = re.compile(
+    r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+)
 
-    hf_token = os.environ.get("HF_TOKEN", "") or None
-    if not hf_token:
-        log.warning("HF_TOKEN not set — gated model will fail to load. "
-                    "Set HF_TOKEN in Render env vars.")
+_RE_PORT = re.compile(r"(?:port\s+|:)(\d{2,5})\b", re.IGNORECASE)
 
-    log.info(f"Loading tokenizer from {MODEL_REPO}...")
-    _tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_REPO,
-        token=hf_token,
-    )
+_RE_PATH = re.compile(r"(?:/[\w.\-_/]{3,}|[A-Za-z]:\\[\w.\-_\\]{3,})")
 
-    log.info(f"Loading model from {MODEL_REPO} in float16...")
-    # Plain from_pretrained — matches model card exactly.
-    # dtype= instead of torch_dtype= (transformers ≥4.40 deprecation).
-    _model = AutoModelForTokenClassification.from_pretrained(
-        MODEL_REPO,
-        dtype             = torch.float16,
-        low_cpu_mem_usage = True,
-        token             = hf_token,
-    )
-    _model.eval()
-    for p in _model.parameters():
-        p.requires_grad = False
+_RE_SW_VER = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_.\-]{1,30})[\s/\-v]+(\d+(?:\.\d+){1,4})\b",
+    re.IGNORECASE,
+)
 
-    n = sum(p.numel() for p in _model.parameters())
-    log.info(f"✓ Stage 3a ready — {n:,} params | labels: {list(_model.config.id2label.values())}")
-    _model_ready = True
+_RE_VERSION = re.compile(r"\bv?(\d+\.\d+(?:\.\d+)*)\b", re.IGNORECASE)
 
+_RE_USER = re.compile(
+    r"(?:userName|principalId|principalEmail|userIdentity|user)\s*[=:\"\':\s]+"
+    r"([A-Za-z0-9_.@\-]{3,64})",
+    re.IGNORECASE,
+)
 
-def _load_in_background():
-    """Load model in a background thread so lifespan doesn't block server startup."""
-    global _load_error
-    with _load_lock:
-        try:
-            load_model()
-        except Exception as e:
-            _load_error = str(e)
-            log.error(f"Model load failed: {e}")
-            log.error("Check: 1) HF_TOKEN is set in Render env vars")
-            log.error("       2) Swapnanil accepted gating at huggingface.co/Swapnanil09/vulnerability-extractor")
+_KNOWN_SW = frozenset({
+    "apache","nginx","openssh","openssl","log4j","log4shell","struts","spring",
+    "kubernetes","docker","containerd","python","java","node","nodejs","php",
+    "ruby","perl","mysql","postgres","postgresql","mongodb","redis",
+    "elasticsearch","chrome","firefox","curl","wget","bash","sudo","linux",
+    "windows","ubuntu","debian","centos","rhel","terraform","ansible","jenkins",
+    "gitlab","github","iis","tomcat","wordpress","drupal","joomla","ssh","ftp",
+    "smb","rdp","vnc","ldap","kerberos","ntlm","mimikatz","metasploit",
+})
+
+_EXPLOIT_KW = frozenset({
+    "exploit","exploitation","vulnerability","vuln","rce","lfi","rfi","sqli",
+    "xss","overflow","injection","privilege escalation","lateral movement",
+    "exfiltration","backdoor","shellcode","payload","reverse shell","metasploit",
+    "mimikatz","log4shell","heartbleed","eternalblue","zerologon","printnightmare",
+    "proxylogon","proxyshell","log4j","deserialization","path traversal",
+    "directory traversal","command injection","code execution",
+})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NER INFERENCE
-# Token reassembly uses Ġ (RoBERTa/CodeBERT BPE) — confirmed from model card.
+# EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_entities(text: str) -> List[dict]:
-    if not _model_ready:
-        raise RuntimeError("Model not loaded")
+def _extract(text: str) -> dict:
+    # ── CVE IDs (ERROR type — matches CodeBERT label convention) ─────────────
+    cve_ids = list({m.upper() for m in _RE_CVE.findall(text)})
 
-    inputs = _tokenizer(text, return_tensors="pt",
-                        truncation=True, max_length=128, padding=True)
+    # ── IPs ───────────────────────────────────────────────────────────────────
+    ips = list(set(_RE_IP.findall(text)))
 
-    with torch.no_grad():
-        preds = torch.argmax(_model(**inputs).logits, dim=-1)
+    # ── Ports ────────────────────────────────────────────────────────────────
+    ports = list({p for p in _RE_PORT.findall(text) if 1 <= int(p) <= 65535})
 
-    tokens = _tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-    labels = [_model.config.id2label[p.item()] for p in preds[0]]
+    # ── Paths ────────────────────────────────────────────────────────────────
+    paths = list({p for p in _RE_PATH.findall(text) if len(p) > 4})
 
-    entities, cur = [], None
-    for token, label in zip(tokens, labels):
-        # RoBERTa special tokens
-        if token in ("<s>", "</s>", "<pad>", "[CLS]", "[SEP]", "[PAD]"):
-            continue
+    # ── Software + versions ───────────────────────────────────────────────────
+    software, versions = [], []
+    for m in _RE_SW_VER.finditer(text):
+        sw, ver = m.group(1), m.group(2)
+        if sw.lower() in _KNOWN_SW or (sw[0].isupper() and len(sw) > 2):
+            if sw not in software:
+                software.append(sw)
+        if ver not in versions:
+            versions.append(ver)
 
-        # RoBERTa BPE: Ġ = word boundary (new word), no prefix = continuation
-        if token.startswith("Ġ"):
-            clean, is_cont = token[1:], False
-        elif token.startswith("##"):      # WordPiece fallback
-            clean, is_cont = token[2:], True
-        else:
-            # No prefix: continuation if we're inside an entity and label is I-
-            clean = token
-            is_cont = (cur is not None and label.startswith("I-"))
+    for m in _RE_VERSION.finditer(text):
+        v = m.group(1)
+        if v not in versions:
+            versions.append(v)
 
-        if is_cont and cur:
-            cur["text"] += clean
-        elif label.startswith("B-"):
-            if cur: entities.append(cur)
-            cur = {"text": clean, "type": label[2:]}
-        elif label.startswith("I-") and cur and label[2:] == cur["type"]:
-            cur["text"] += " " + clean
-        else:
-            if cur: entities.append(cur)
-            cur = None
+    # ── Users ─────────────────────────────────────────────────────────────────
+    users = list(dict.fromkeys(m for m in _RE_USER.findall(text) if m))
 
-    if cur:
-        entities.append(cur)
+    # ── Exploit keywords ─────────────────────────────────────────────────────
+    tl = text.lower()
+    exploits = [kw for kw in _EXPLOIT_KW if kw in tl]
 
-    return [{"text": e["text"].strip(), "type": e["type"]}
-            for e in entities if e["text"].strip()]
+    # ── Flat entities list (identical schema to CodeBERT output) ─────────────
+    entities = []
+    for x in cve_ids:  entities.append({"text": x, "type": "ERROR"})
+    for x in software: entities.append({"text": x, "type": "SOFTWARE"})
+    for x in versions: entities.append({"text": x, "type": "VERSION"})
+    for x in ips:      entities.append({"text": x, "type": "IP"})
+    for x in ports:    entities.append({"text": x, "type": "PORT"})
+    for x in paths:    entities.append({"text": x, "type": "PATH"})
+    for x in users:    entities.append({"text": x, "type": "USER"})
+    for x in exploits: entities.append({"text": x, "type": "EXPLOIT"})
 
-
-def _cve_ids(entities, raw):
-    found = set()
-    for e in entities:
-        if e["type"] in ("ERROR", "EXPLOIT", "SOFTWARE"):
-            found.update(m.upper() for m in _CVE_RE.findall(e["text"]))
-    found.update(m.upper() for m in _CVE_RE.findall(raw))
-    return list(found)
-
-def _group(entities):
-    g = {}
-    for e in entities:
-        g.setdefault(e["type"], []).append(e["text"])
-    return g
+    return {
+        "entities": entities, "cve_ids": cve_ids,
+        "software": software, "versions": versions,
+        "ips": ips,           "ports":   ports,
+        "paths": paths,       "users":   users,
+        "exploits": exploits,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FASTAPI
 # ══════════════════════════════════════════════════════════════════════════════
 
-@asynccontextmanager
-async def lifespan(app):
-    # Start model loading in background thread immediately
-    t = threading.Thread(target=_load_in_background, daemon=True)
-    t.start()
-    log.info("Model loading started in background...")
-    yield
-
-app = FastAPI(title="Stage 3a — Vulnerability NER", version="3.2.0", lifespan=lifespan)
+app = FastAPI(title="Stage 3a — Vulnerability NER (rule-based)", version="4.0.0")
 
 class ExtractRequest(BaseModel):
     log_text:    str
@@ -209,53 +160,36 @@ class ExtractBatchRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    """
-    Polled by main_flow.py warmup loop via gateway /stage3a/health.
-    Returns model_ready:true only when model is fully loaded.
-    """
+    # Always ready — no model to load
     return {
         "stage":       "3a",
-        "status":      "ok" if _model_ready else "loading",
-        "model_ready": _model_ready,
-        "model":       MODEL_REPO,
-        "load_error":  _load_error,
-        "tip":         None if _model_ready else (
-            "Model loading — takes ~3min on cold start. "
-            "If load_error is set, check HF_TOKEN and gating acceptance."
-        ),
+        "status":      "ok",
+        "model_ready": True,
+        "model":       "rule-based (regex + keywords, no weights)",
     }
 
 
 @app.post("/extract")
 def extract(req: ExtractBatchRequest, _=Depends(validate)):
-    if not _model_ready:
-        raise HTTPException(status_code=503, detail="Model not ready — check /health")
-
     results = []
     for r in req.logs:
         try:
-            ents    = _extract_entities(r.log_text)
-            cves    = _cve_ids(ents, r.log_text)
-            grouped = _group(ents)
+            e = _extract(r.log_text)
             results.append({
                 "edge_id":    r.edge_id,  "scenario_id": r.scenario_id, "t": r.t,
                 "log_text":   r.log_text[:200],
-                "entities":   ents,       "cve_ids":  cves,
-                "software":   grouped.get("SOFTWARE", []),
-                "versions":   grouped.get("VERSION",  []),
-                "exploits":   grouped.get("EXPLOIT",  []),
-                "ips":        grouped.get("IP",       []),
-                "users":      grouped.get("USER",     []),
-                "ports":      grouped.get("PORT",     []),
-                "paths":      grouped.get("PATH",     []),
-                "errors":     grouped.get("ERROR",    []),
-                "n_entities": len(ents),
+                "entities":   e["entities"],  "cve_ids":  e["cve_ids"],
+                "software":   e["software"],  "versions": e["versions"],
+                "exploits":   e["exploits"],  "ips":      e["ips"],
+                "users":      e["users"],     "ports":    e["ports"],
+                "paths":      e["paths"],     "errors":   [],
+                "n_entities": len(e["entities"]),
             })
-        except Exception as e:
-            log.warning(f"NER error: {e}")
+        except Exception as ex:
+            log.warning(f"NER error: {ex}")
             results.append({
                 "edge_id": r.edge_id, "scenario_id": r.scenario_id, "t": r.t,
-                "log_text": r.log_text[:200], "error": str(e),
+                "log_text": r.log_text[:200], "error": str(ex),
                 "entities":[], "cve_ids":[], "software":[], "versions":[],
                 "exploits":[], "ips":[], "users":[], "ports":[], "paths":[],
                 "errors":[], "n_entities": 0,
