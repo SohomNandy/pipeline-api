@@ -464,7 +464,7 @@ def create_app():
             "stage9_ready":True,
             "stage10_ready": groq_client is not None,
         }
-
+ 
     @web.post("/explain_and_report")
     def explain_and_report(req: ExplainRequest, _=Depends(validate)):
         """
