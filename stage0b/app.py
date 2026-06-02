@@ -1644,8 +1644,8 @@ API_KEY       = os.environ.get("STAGE_0B_API_KEY", "")
 # Each request ≈ 600 prompt tokens + 400 completion = ~1000 tokens
 # 500k / 1000 = 500 events per day on free tier
 # Paid tier: no daily limit, just RPM
-RATE_LIMIT_RPM = 30     # conservative — stay well under Groq's 6000 RPM
-REQUEST_DELAY  = 60 / RATE_LIMIT_RPM   # seconds between requests
+RATE_LIMIT_RPM = 200    # well within Groq's 6000 RPM free tier → ~4.5 min for 900 events
+REQUEST_DELAY  = 60 / RATE_LIMIT_RPM   # = 0.3 seconds between requests
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROVIDER-SPECIFIC SYSTEM PROMPTS (from your notebook Cell 5)
@@ -1990,45 +1990,218 @@ def generate_batch(req: BatchRequest, _: str = Depends(_validate)):
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EVENT CORPUS  — 900 structured events (300 per provider)
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_event_corpus() -> list[dict]:
+    import random, itertools
+    rng = random.Random(42)
+
+    users         = [f"user_{n}" for n in ["alice","bob","carol","dave","eve",
+                                            "frank","grace","henry","ivan","julia"]]
+    mal_ips       = ["185.220.101.45","45.142.212.100","198.51.100.23",
+                     "103.21.244.0","91.108.4.0","192.0.2.77","203.0.113.99"]
+    benign_ips    = ["10.0.0.5","10.0.1.12","172.16.0.8","192.168.1.100",
+                     "10.10.10.50","172.31.5.3","10.0.2.20"]
+    scenarios     = [f"sc_{i:03d}" for i in range(1, 51)]
+    attack_phases = ["privilege_escalation","lateral_movement",
+                     "cross_cloud_pivot","cve_exploitation"]
+
+    def _meta(i, provider, malicious, phase):
+        sid = rng.choice(scenarios)
+        ip  = rng.choice(mal_ips if malicious else benign_ips)
+        return {
+            "edge_id":      f"e_{i:04d}",
+            "scenario_id":  sid,
+            "t":            rng.randint(0, 19),
+            "malicious":    malicious,
+            "attack_phase": phase,
+            "source_ip":    ip,
+            "entity_id":    rng.choice(users),
+            "entity_type":  "User",
+            "status":       "Success" if malicious == 0 or rng.random() > 0.3 else "Failure",
+            "provider":     provider,
+        }
+
+    # AWS templates
+    aws_templates = [
+        ("AssumeRole",                    "admin_role",           "us-east-1",  "123456789012", 0.6),
+        ("AssumeRole",                    "devops_role",          "us-west-2",  "123456789012", 0.4),
+        ("GetObject",                     "prod-data-bucket",     "us-west-2",  "123456789012", 0.1),
+        ("GetObject",                     "backup-bucket",        "eu-west-1",  "234567890123", 0.1),
+        ("PutObject",                     "log-archive-bucket",   "us-east-1",  "123456789012", 0.2),
+        ("RunInstances",                  "vm_001",               "eu-west-1",  "123456789012", 0.5),
+        ("RunInstances",                  "vm_009",               "ap-south-1", "234567890123", 0.5),
+        ("DescribeInstances",             "vpc_001",              "us-east-1",  "123456789012", 0.0),
+        ("CreateUser",                    "svc-account-new",      "us-east-1",  "123456789012", 0.7),
+        ("AttachUserPolicy",              "arn:aws:iam::aws:policy/AdministratorAccess",
+                                                                  "us-east-1",  "123456789012", 0.9),
+        ("DeleteTrail",                   "mgmt-trail",           "us-east-1",  "123456789012", 0.95),
+        ("StopLogging",                   "mgmt-trail",           "us-east-1",  "123456789012", 0.95),
+        ("InvokeFunction",                "data-exfil-fn",        "us-east-1",  "123456789012", 0.8),
+        ("InvokeFunction",                "notify-fn",            "us-west-2",  "123456789012", 0.1),
+        ("ListBuckets",                   "",                     "us-east-1",  "123456789012", 0.3),
+        ("GetSecretValue",                "prod/db-password",     "us-east-1",  "123456789012", 0.6),
+        ("DescribeSecurityGroups",        "sg-001",               "us-east-1",  "123456789012", 0.2),
+        ("AuthorizeSecurityGroupIngress", "sg-001",               "us-east-1",  "123456789012", 0.7),
+        ("CreateAccessKey",               "user_alice",           "us-east-1",  "123456789012", 0.8),
+        ("ConsoleLogin",                  "",                     "us-east-1",  "123456789012", 0.3),
+    ]
+    aws_events = []
+    for i, tmpl in enumerate(itertools.islice(itertools.cycle(aws_templates), 300)):
+        action, target, region, acct, mw = tmpl
+        mal = 1 if rng.random() < mw else 0
+        phase = rng.choice(attack_phases) if mal else "benign"
+        ev = _meta(i + 1, "AWS", mal, phase)
+        ev.update({"action": action, "target_id": target, "region": region, "cloud_account": acct})
+        aws_events.append(ev)
+
+    # Azure templates
+    azure_templates = [
+        ("Microsoft.Compute/virtualMachines/start",         "vm_005",      "eastus",      "sub-prod-001", 0.5),
+        ("Microsoft.Compute/virtualMachines/delete",        "vm_012",      "westeurope",  "sub-prod-001", 0.7),
+        ("Microsoft.Compute/virtualMachines/write",         "vm_007",      "eastus2",     "sub-dev-002",  0.4),
+        ("Microsoft.Authorization/roleAssignments/write",   "admin-role",  "eastus",      "sub-prod-001", 0.85),
+        ("Microsoft.Authorization/roleAssignments/delete",  "reader-role", "eastus",      "sub-prod-001", 0.6),
+        ("Microsoft.KeyVault/vaults/secrets/read",          "kv-prod",     "eastus",      "sub-prod-001", 0.5),
+        ("Microsoft.KeyVault/vaults/secrets/write",         "kv-prod",     "eastus",      "sub-prod-001", 0.7),
+        ("Microsoft.Storage/storageAccounts/read",          "sa001",       "eastus",      "sub-prod-001", 0.1),
+        ("Microsoft.Storage/storageAccounts/write",         "sa002",       "westus",      "sub-prod-001", 0.3),
+        ("Microsoft.Network/networkSecurityGroups/write",   "nsg-001",     "eastus",      "sub-prod-001", 0.6),
+        ("Microsoft.Network/virtualNetworks/read",          "vnet-01",     "eastus",      "sub-prod-001", 0.1),
+        ("Microsoft.Sql/servers/databases/read",            "db-prod",     "eastus",      "sub-prod-001", 0.2),
+        ("Microsoft.Sql/servers/firewallRules/write",       "db-prod",     "eastus",      "sub-prod-001", 0.75),
+        ("Microsoft.Web/sites/restart",                     "webapp-01",   "eastus",      "sub-dev-002",  0.3),
+        ("Microsoft.ContainerRegistry/registries/push",     "acr-01",      "eastus",      "sub-prod-001", 0.4),
+        ("Microsoft.Insights/diagnosticSettings/delete",    "audit-diag",  "eastus",      "sub-prod-001", 0.9),
+        ("Microsoft.AAD/users/write",                       "user_carol",  "eastus",      "sub-prod-001", 0.5),
+        ("Microsoft.AAD/servicePrincipals/write",           "svc-exfil",   "eastus",      "sub-prod-001", 0.8),
+        ("Microsoft.Compute/snapshots/write",               "snap-001",    "eastus",      "sub-prod-001", 0.5),
+        ("Microsoft.Resources/deployments/write",           "deploy-01",   "eastus",      "sub-prod-001", 0.3),
+    ]
+    azure_entities = ["john.doe@corp.com","alice.smith@corp.com","bob.jones@corp.com",
+                      "carol.white@corp.com","dave.brown@corp.com","svc-principal@corp.com"]
+    azure_events = []
+    for i, tmpl in enumerate(itertools.islice(itertools.cycle(azure_templates), 300)):
+        action, target, region, acct, mw = tmpl
+        mal = 1 if rng.random() < mw else 0
+        phase = rng.choice(attack_phases) if mal else "benign"
+        ev = _meta(i + 301, "Azure", mal, phase)
+        ev.update({"action": action, "target_id": target, "region": region,
+                   "cloud_account": acct, "entity_id": rng.choice(azure_entities)})
+        azure_events.append(ev)
+
+    # GCP templates
+    gcp_templates = [
+        ("compute.instances.insert",                    "vm_001",           "us-central1",  "gcp-prod-project", 0.4),
+        ("compute.instances.delete",                    "vm_003",           "us-east1",     "gcp-prod-project", 0.6),
+        ("compute.instances.setMetadata",               "vm_008",           "us-central1",  "gcp-prod-project", 0.8),
+        ("compute.instances.start",                     "vm_002",           "europe-west1", "gcp-dev-project",  0.2),
+        ("compute.instances.stop",                      "vm_004",           "us-central1",  "gcp-prod-project", 0.3),
+        ("iam.serviceAccounts.create",                  "svc-exfil",        "us-central1",  "gcp-prod-project", 0.85),
+        ("iam.serviceAccounts.setIamPolicy",            "svc-admin",        "us-central1",  "gcp-prod-project", 0.9),
+        ("iam.serviceAccountKeys.create",               "svc-001",          "us-central1",  "gcp-prod-project", 0.8),
+        ("storage.buckets.list",                        "",                 "us-central1",  "gcp-prod-project", 0.2),
+        ("storage.objects.get",                         "bucket-prod",      "us",           "gcp-prod-project", 0.1),
+        ("storage.objects.create",                      "bucket-exfil",     "us",           "gcp-prod-project", 0.7),
+        ("cloudfunctions.functions.call",               "fn-exec",          "us-central1",  "gcp-dev-project",  0.5),
+        ("cloudsql.instances.update",                   "db-prod",          "us-central1",  "gcp-prod-project", 0.4),
+        ("container.clusters.create",                   "k8s-001",          "us-central1",  "gcp-prod-project", 0.3),
+        ("container.clusters.delete",                   "k8s-002",          "us-central1",  "gcp-prod-project", 0.6),
+        ("logging.sinks.delete",                        "audit-sink",       "global",       "gcp-prod-project", 0.9),
+        ("cloudkms.cryptoKeyVersions.destroy",          "key-001",          "us-central1",  "gcp-prod-project", 0.8),
+        ("bigquery.tables.create",                      "dataset-01",       "us",           "gcp-prod-project", 0.2),
+        ("bigquery.tables.getData",                     "dataset-01",       "us",           "gcp-prod-project", 0.3),
+        ("resourcemanager.projects.setIamPolicy",       "gcp-prod-project", "global",       "gcp-prod-project", 0.9),
+    ]
+    gcp_entities = [f"{u}@gcp-prod-project.iam.gserviceaccount.com"
+                    for u in ["svc-worker","svc-admin","mal-ip-node","svc-exfil","svc-deploy"]] + \
+                   [f"{u}@corp.com" for u in ["alice","bob","carol","dave","eve"]]
+    gcp_events = []
+    for i, tmpl in enumerate(itertools.islice(itertools.cycle(gcp_templates), 300)):
+        action, target, region, acct, mw = tmpl
+        mal = 1 if rng.random() < mw else 0
+        phase = rng.choice(attack_phases) if mal else "benign"
+        ev = _meta(i + 601, "GCP", mal, phase)
+        ev.update({"action": action, "target_id": target, "region": region,
+                   "cloud_account": acct, "entity_id": rng.choice(gcp_entities)})
+        gcp_events.append(ev)
+
+    rng.shuffle(aws_events)
+    rng.shuffle(azure_events)
+    rng.shuffle(gcp_events)
+    return aws_events + azure_events + gcp_events
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /generate_batch_lot  — one POST → 900 logs → 4 parquets saved on server
+# ─────────────────────────────────────────────────────────────────────────────
 @web.post("/generate_batch_lot")
 def generate_batch_lot(_: str = Depends(_validate)):
     """
-    Generates 900 provider-native logs (300 x AWS, 300 x Azure, 300 x GCP)
-    using the built-in event corpus.  No request body needed — just POST to
-    this endpoint and it returns all 900 results grouped by provider.
+    Generates 900 provider-native logs (300 x AWS, 300 x Azure, 300 x GCP),
+    saves them server-side as parquets, AND returns all rows in the response
+    so the caller can also save them locally.
 
-    Response shape:
+    No request body needed — just POST to this endpoint.
+
+    Server writes to ./stage0b_outputs/:
+        aws_logs.parquet  |  azure_logs.parquet  |  gcp_logs.parquet  |  all_logs.parquet
+
+    Response:
     {
       "total": 900,
       "fallback_count": <int>,
       "fallback_rate": <float>,
-      "providers": {
-        "AWS":   { "count": 300, "results": [ ... ] },
-        "Azure": { "count": 300, "results": [ ... ] },
-        "GCP":   { "count": 300, "results": [ ... ] }
-      }
+      "output_dir": "<abs path on server>",
+      "files": {"AWS": "aws_logs.parquet", "Azure": "...", "GCP": "...", "all": "all_logs.parquet"},
+      "rows": [ {"raw_log": "{...}", "provider": "AWS", "scenario_id": "...",
+                 "t": 5, "malicious": 1, "attack_phase": "...", "_fallback": false}, ... ]
     }
     """
+    import pandas as pd
+    from pathlib import Path
+
+    output_dir = "./stage0b_outputs"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
     events    = _build_event_corpus()   # 900 structured events
     fallbacks = 0
-    by_prov   = {"AWS": [], "Azure": [], "GCP": []}
+    rows      = []
 
     for ev in events:
         r = generate_one(ev)
         if r["fallback"]:
             fallbacks += 1
-        by_prov[ev["provider"]].append(r)
+        log  = r["log"]
+        meta = log.get("_pipeline_meta", _make_meta(ev))
+        rows.append({
+            "raw_log":      json.dumps(log, separators=(",", ":"), default=str),
+            "provider":     meta.get("provider",     ev["provider"]),
+            "scenario_id":  meta.get("scenario_id",  ev["scenario_id"]),
+            "t":            int(meta.get("t",         ev["t"])),
+            "malicious":    int(meta.get("malicious", ev["malicious"])),
+            "attack_phase": meta.get("attack_phase",  ev["attack_phase"]),
+            "_fallback":    r["fallback"],
+        })
         time.sleep(REQUEST_DELAY)
 
-    total = sum(len(v) for v in by_prov.values())
+    # Save parquets server-side
+    all_df = pd.DataFrame(rows)
+    provider_map = {"AWS": "aws_logs.parquet", "Azure": "azure_logs.parquet", "GCP": "gcp_logs.parquet"}
+    for prov, fname in provider_map.items():
+        sub = all_df[all_df["provider"] == prov].reset_index(drop=True)
+        sub.to_parquet(os.path.join(output_dir, fname), index=False)
+    all_df.to_parquet(os.path.join(output_dir, "all_logs.parquet"), index=False)
+
+    total = len(rows)
     return {
         "total":          total,
         "fallback_count": fallbacks,
         "fallback_rate":  round(fallbacks / total, 3) if total else 0,
-        "providers": {
-            prov: {"count": len(results), "results": results}
-            for prov, results in by_prov.items()
-        },
+        "output_dir":     os.path.abspath(output_dir),
+        "files":          {**{p: f for p, f in provider_map.items()}, "all": "all_logs.parquet"},
+        "rows":           rows,
     }
 
 
@@ -2049,7 +2222,6 @@ def run_batch(input_path: str, output_dir: str, checkpoint_every: int = 500):
     print(f"Loaded {len(df):,} events from {input_path}")
     print(f"Provider counts:\n{df['provider'].value_counts().to_string()}")
 
-    # Resume from checkpoint if it exists
     already_done = set()
     done_rows    = []
     if os.path.exists(checkpoint_path):
@@ -2058,9 +2230,9 @@ def run_batch(input_path: str, output_dir: str, checkpoint_every: int = 500):
         done_rows    = ckpt_df.to_dict("records")
         print(f"Resuming: {len(done_rows):,} already processed, {len(df)-len(done_rows):,} remaining")
 
-    events     = df.to_dict("records")
-    results    = list(done_rows)
-    fallbacks  = 0
+    events    = df.to_dict("records")
+    results   = list(done_rows)
+    fallbacks = 0
 
     for ev in tqdm(events):
         key = (str(ev.get("scenario_id","")), str(ev.get("t","")), str(ev.get("edge_id","")))
@@ -2085,12 +2257,10 @@ def run_batch(input_path: str, output_dir: str, checkpoint_every: int = 500):
         already_done.add(key)
         time.sleep(REQUEST_DELAY)
 
-        # Save checkpoint every N rows
         if len(results) % checkpoint_every == 0:
             pd.DataFrame(results).to_parquet(checkpoint_path, index=False)
             print(f"  Checkpoint saved ({len(results):,} done, {fallbacks} fallbacks)")
 
-    # Final save
     out_df = pd.DataFrame(results)
     out_df.to_parquet(combined_path, index=False)
 
@@ -2102,188 +2272,20 @@ def run_batch(input_path: str, output_dir: str, checkpoint_every: int = 500):
     print(f"\nDone. {len(out_df):,} total logs, {fallbacks} fallbacks ({100*fallbacks/len(out_df):.1f}%)")
     print(f"Outputs in: {output_dir}")
 
-    # Clean up checkpoint
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELF-GEN  — calls THIS app's /generate_batch endpoint to produce
-#             300 logs per provider → aws_logs.parquet, azure_logs.parquet,
-#             gcp_logs.parquet, all_logs.parquet   (Stage 1 input)
-#
-# Usage (from any machine — Render must be running):
-#   python app.py --selfgen
-#   python app.py --selfgen --url https://stage0b-attack-sim.onrender.com
-#                           --apikey cb84a4ee...
-#                           --output ./outputs
-#                           --batch-size 25
+# run_selfgen  — local script that calls Render /generate_batch in batches
+#               and saves the 4 parquets locally
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ── 300-event corpus: 100 per provider, varied actions / phases / IPs ────────
-def _build_event_corpus() -> list[dict]:
-    """
-    Returns a list of 300 structured events (100 AWS, 100 Azure, 100 GCP).
-    Every event is a valid EventRequest payload.  Values are varied enough
-    that Groq produces semantically diverse logs rather than near-duplicates.
-    """
-    import random, itertools
-    rng = random.Random(42)   # reproducible
-
-    # ── shared pools ──────────────────────────────────────────────────────────
-    users       = [f"user_{n}" for n in ["alice","bob","carol","dave","eve",
-                                          "frank","grace","henry","ivan","julia"]]
-    mal_ips     = ["185.220.101.45","45.142.212.100","198.51.100.23",
-                   "103.21.244.0","91.108.4.0","192.0.2.77","203.0.113.99"]
-    benign_ips  = ["10.0.0.5","10.0.1.12","172.16.0.8","192.168.1.100",
-                   "10.10.10.50","172.31.5.3","10.0.2.20"]
-    scenarios   = [f"sc_{i:03d}" for i in range(1, 51)]   # sc_001 … sc_050
-    attack_phases = ["privilege_escalation","lateral_movement",
-                     "cross_cloud_pivot","cve_exploitation"]
-
-    def _meta(i: int, provider: str, malicious: int, phase: str) -> dict:
-        sid = rng.choice(scenarios)
-        ip  = rng.choice(mal_ips if malicious else benign_ips)
-        return {
-            "edge_id":      f"e_{i:04d}",
-            "scenario_id":  sid,
-            "t":            rng.randint(0, 19),
-            "malicious":    malicious,
-            "attack_phase": phase,
-            "source_ip":    ip,
-            "entity_id":    rng.choice(users),
-            "entity_type":  "User",
-            "status":       "Success" if malicious == 0 or rng.random() > 0.3 else "Failure",
-            "provider":     provider,
-        }
-
-    # ── AWS events (300) ──────────────────────────────────────────────────────
-    aws_templates = [
-        # (action, target_id, region, cloud_account, malicious_weight)
-        ("AssumeRole",          "admin_role",           "us-east-1",  "123456789012", 0.6),
-        ("AssumeRole",          "devops_role",          "us-west-2",  "123456789012", 0.4),
-        ("GetObject",           "prod-data-bucket",     "us-west-2",  "123456789012", 0.1),
-        ("GetObject",           "backup-bucket",        "eu-west-1",  "234567890123", 0.1),
-        ("PutObject",           "log-archive-bucket",   "us-east-1",  "123456789012", 0.2),
-        ("RunInstances",        "vm_001",               "eu-west-1",  "123456789012", 0.5),
-        ("RunInstances",        "vm_009",               "ap-south-1", "234567890123", 0.5),
-        ("DescribeInstances",   "vpc_001",              "us-east-1",  "123456789012", 0.0),
-        ("CreateUser",          "svc-account-new",      "us-east-1",  "123456789012", 0.7),
-        ("AttachUserPolicy",    "arn:aws:iam::aws:policy/AdministratorAccess",
-                                                        "us-east-1",  "123456789012", 0.9),
-        ("DeleteTrail",         "mgmt-trail",           "us-east-1",  "123456789012", 0.95),
-        ("StopLogging",         "mgmt-trail",           "us-east-1",  "123456789012", 0.95),
-        ("InvokeFunction",      "data-exfil-fn",        "us-east-1",  "123456789012", 0.8),
-        ("InvokeFunction",      "notify-fn",            "us-west-2",  "123456789012", 0.1),
-        ("ListBuckets",         "",                     "us-east-1",  "123456789012", 0.3),
-        ("GetSecretValue",      "prod/db-password",     "us-east-1",  "123456789012", 0.6),
-        ("DescribeSecurityGroups","sg-001",             "us-east-1",  "123456789012", 0.2),
-        ("AuthorizeSecurityGroupIngress","sg-001",      "us-east-1",  "123456789012", 0.7),
-        ("CreateAccessKey",     "user_alice",           "us-east-1",  "123456789012", 0.8),
-        ("ConsoleLogin",        "",                     "us-east-1",  "123456789012", 0.3),
-    ]
-    aws_events = []
-    for i, tmpl in enumerate(itertools.islice(itertools.cycle(aws_templates), 300)):
-        action, target, region, acct, mw = tmpl
-        mal = 1 if rng.random() < mw else 0
-        phase = rng.choice(attack_phases) if mal else "benign"
-        ev = _meta(i + 1, "AWS", mal, phase)
-        ev.update({"action": action, "target_id": target,
-                   "region": region, "cloud_account": acct})
-        aws_events.append(ev)
-
-    # ── Azure events (300) ────────────────────────────────────────────────────
-    azure_templates = [
-        ("Microsoft.Compute/virtualMachines/start",   "vm_005", "eastus",       "sub-prod-001", 0.5),
-        ("Microsoft.Compute/virtualMachines/delete",  "vm_012", "westeurope",   "sub-prod-001", 0.7),
-        ("Microsoft.Compute/virtualMachines/write",   "vm_007", "eastus2",      "sub-dev-002",  0.4),
-        ("Microsoft.Authorization/roleAssignments/write","admin-role","eastus",  "sub-prod-001", 0.85),
-        ("Microsoft.Authorization/roleAssignments/delete","reader-role","eastus","sub-prod-001", 0.6),
-        ("Microsoft.KeyVault/vaults/secrets/read",    "kv-prod","eastus",        "sub-prod-001", 0.5),
-        ("Microsoft.KeyVault/vaults/secrets/write",   "kv-prod","eastus",        "sub-prod-001", 0.7),
-        ("Microsoft.Storage/storageAccounts/read",    "sa001",  "eastus",        "sub-prod-001", 0.1),
-        ("Microsoft.Storage/storageAccounts/write",   "sa002",  "westus",        "sub-prod-001", 0.3),
-        ("Microsoft.Network/networkSecurityGroups/write","nsg-001","eastus",     "sub-prod-001", 0.6),
-        ("Microsoft.Network/virtualNetworks/read",    "vnet-01","eastus",        "sub-prod-001", 0.1),
-        ("Microsoft.Sql/servers/databases/read",      "db-prod","eastus",        "sub-prod-001", 0.2),
-        ("Microsoft.Sql/servers/firewallRules/write", "db-prod","eastus",        "sub-prod-001", 0.75),
-        ("Microsoft.Web/sites/restart",               "webapp-01","eastus",      "sub-dev-002",  0.3),
-        ("Microsoft.ContainerRegistry/registries/push","acr-01","eastus",        "sub-prod-001", 0.4),
-        ("Microsoft.Insights/diagnosticSettings/delete","audit-diag","eastus",   "sub-prod-001", 0.9),
-        ("Microsoft.AAD/users/write",                 "user_carol","eastus",     "sub-prod-001", 0.5),
-        ("Microsoft.AAD/servicePrincipals/write",     "svc-exfil","eastus",      "sub-prod-001", 0.8),
-        ("Microsoft.Compute/snapshots/write",         "snap-001","eastus",       "sub-prod-001", 0.5),
-        ("Microsoft.Resources/deployments/write",     "deploy-01","eastus",      "sub-prod-001", 0.3),
-    ]
-    azure_entities = ["john.doe@corp.com","alice.smith@corp.com","bob.jones@corp.com",
-                      "carol.white@corp.com","dave.brown@corp.com","svc-principal@corp.com"]
-    azure_events = []
-    for i, tmpl in enumerate(itertools.islice(itertools.cycle(azure_templates), 300)):
-        action, target, region, acct, mw = tmpl
-        mal = 1 if rng.random() < mw else 0
-        phase = rng.choice(attack_phases) if mal else "benign"
-        ev = _meta(i + 301, "Azure", mal, phase)
-        ev.update({"action": action, "target_id": target,
-                   "region": region, "cloud_account": acct,
-                   "entity_id": rng.choice(azure_entities)})
-        azure_events.append(ev)
-
-    # ── GCP events (300) ──────────────────────────────────────────────────────
-    gcp_templates = [
-        ("compute.instances.insert",        "vm_001", "us-central1",    "gcp-prod-project",  0.4),
-        ("compute.instances.delete",        "vm_003", "us-east1",       "gcp-prod-project",  0.6),
-        ("compute.instances.setMetadata",   "vm_008", "us-central1",    "gcp-prod-project",  0.8),
-        ("compute.instances.start",         "vm_002", "europe-west1",   "gcp-dev-project",   0.2),
-        ("compute.instances.stop",          "vm_004", "us-central1",    "gcp-prod-project",  0.3),
-        ("iam.serviceAccounts.create",      "svc-exfil","us-central1",  "gcp-prod-project",  0.85),
-        ("iam.serviceAccounts.setIamPolicy","svc-admin","us-central1",  "gcp-prod-project",  0.9),
-        ("iam.serviceAccountKeys.create",   "svc-001","us-central1",    "gcp-prod-project",  0.8),
-        ("storage.buckets.list",            "",       "us-central1",    "gcp-prod-project",  0.2),
-        ("storage.objects.get",             "bucket-prod","us",         "gcp-prod-project",  0.1),
-        ("storage.objects.create",          "bucket-exfil","us",        "gcp-prod-project",  0.7),
-        ("cloudfunctions.functions.call",   "fn-exec","us-central1",   "gcp-dev-project",   0.5),
-        ("cloudsql.instances.update",       "db-prod","us-central1",   "gcp-prod-project",  0.4),
-        ("container.clusters.create",       "k8s-001","us-central1",   "gcp-prod-project",  0.3),
-        ("container.clusters.delete",       "k8s-002","us-central1",   "gcp-prod-project",  0.6),
-        ("logging.sinks.delete",            "audit-sink","global",      "gcp-prod-project",  0.9),
-        ("cloudkms.cryptoKeyVersions.destroy","key-001","us-central1", "gcp-prod-project",  0.8),
-        ("bigquery.tables.create",          "dataset-01","us",         "gcp-prod-project",  0.2),
-        ("bigquery.tables.getData",         "dataset-01","us",         "gcp-prod-project",  0.3),
-        ("resourcemanager.projects.setIamPolicy","gcp-prod-project","global","gcp-prod-project",0.9),
-    ]
-    gcp_entities = [f"{u}@gcp-prod-project.iam.gserviceaccount.com" for u in
-                    ["svc-worker","svc-admin","mal-ip-node","svc-exfil","svc-deploy"]] + \
-                   [f"{u}@corp.com" for u in ["alice","bob","carol","dave","eve"]]
-    gcp_events = []
-    for i, tmpl in enumerate(itertools.islice(itertools.cycle(gcp_templates), 300)):
-        action, target, region, acct, mw = tmpl
-        mal = 1 if rng.random() < mw else 0
-        phase = rng.choice(attack_phases) if mal else "benign"
-        ev = _meta(i + 601, "GCP", mal, phase)
-        ev.update({"action": action, "target_id": target,
-                   "region": region, "cloud_account": acct,
-                   "entity_id": rng.choice(gcp_entities)})
-        gcp_events.append(ev)
-
-    # Shuffle within each provider so attack/benign events interleave
-    rng.shuffle(aws_events)
-    rng.shuffle(azure_events)
-    rng.shuffle(gcp_events)
-
-    return aws_events + azure_events + gcp_events
-
-
 def run_selfgen(
     base_url:   str = "https://stage0b-attack-sim.onrender.com",
     api_key:    str = "",
     output_dir: str = "./stage0b_outputs",
     batch_size: int = 25,
 ):
-    """
-    Calls /generate_batch on the running Render service to produce
-    300 logs per provider, then saves:
-        aws_logs.parquet  /  azure_logs.parquet  /  gcp_logs.parquet  /  all_logs.parquet
-    """
     import requests, pandas as pd
     from pathlib import Path
 
@@ -2293,9 +2295,9 @@ def run_selfgen(
     if api_key:
         headers["X-API-Key"] = api_key
 
-    events  = _build_event_corpus()          # 300 structured events
-    total   = len(events)
-    rows    = []
+    events    = _build_event_corpus()
+    total     = len(events)
+    rows      = []
     fallbacks = 0
 
     print(f"Stage 0b self-gen  →  {url}")
@@ -2304,21 +2306,14 @@ def run_selfgen(
 
     for start in range(0, total, batch_size):
         chunk = events[start : start + batch_size]
-        print(f"  Sending batch {start//batch_size + 1} "
-              f"({start+1}–{min(start+batch_size, total)}/{total}) …", end=" ", flush=True)
-
+        print(f"  Batch {start//batch_size + 1:>3}  ({start+1}–{min(start+batch_size, total)}/{total}) …",
+              end=" ", flush=True)
         try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json={"events": chunk},
-                timeout=300,
-            )
+            resp = requests.post(url, headers=headers, json={"events": chunk}, timeout=300)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
             print(f"ERROR — {exc}")
-            # On HTTP failure, build fallback rows for the whole chunk
             for ev in chunk:
                 fb_log = _fallback(ev)
                 meta   = _make_meta(ev)
@@ -2351,27 +2346,19 @@ def run_selfgen(
                 "_fallback":    result.get("fallback", False),
             })
 
-    # ── Save parquets ──────────────────────────────────────────────────────────
     all_df = pd.DataFrame(rows)
-
-    provider_map = {"AWS": "aws_logs.parquet",
-                    "Azure": "azure_logs.parquet",
-                    "GCP": "gcp_logs.parquet"}
-
+    provider_map = {"AWS": "aws_logs.parquet", "Azure": "azure_logs.parquet", "GCP": "gcp_logs.parquet"}
     for prov, fname in provider_map.items():
         sub = all_df[all_df["provider"] == prov].reset_index(drop=True)
         out = os.path.join(output_dir, fname)
         sub.to_parquet(out, index=False)
-        size_kb = os.path.getsize(out) / 1024
-        print(f"  ✓  {fname:<22}  {len(sub):>3} rows  {size_kb:.1f} KB")
+        print(f"  ✓  {fname:<22}  {len(sub):>3} rows  {os.path.getsize(out)/1024:.1f} KB")
 
     all_path = os.path.join(output_dir, "all_logs.parquet")
     all_df.to_parquet(all_path, index=False)
-    size_kb = os.path.getsize(all_path) / 1024
-    print(f"  ✓  {'all_logs.parquet':<22}  {len(all_df):>3} rows  {size_kb:.1f} KB")
-
-    fb_pct = 100 * fallbacks / len(all_df) if all_df is not None and len(all_df) else 0
-    print(f"\nDone — {len(all_df)} logs total  |  fallbacks: {fallbacks} ({fb_pct:.1f}%)")
+    print(f"  ✓  {'all_logs.parquet':<22}  {len(all_df):>3} rows  {os.path.getsize(all_path)/1024:.1f} KB")
+    fb_pct = 100 * fallbacks / len(all_df) if len(all_df) else 0
+    print(f"\nDone — {len(all_df)} logs  |  fallbacks: {fallbacks} ({fb_pct:.1f}%)")
     print(f"Output dir: {os.path.abspath(output_dir)}")
 
 
@@ -2382,62 +2369,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trinetra Stage 0b")
     sub = parser.add_subparsers(dest="cmd")
 
-    # ── selfgen ───────────────────────────────────────────────────────────────
-    sg = sub.add_parser("selfgen",
-        help="Call the running Render service to generate 300 logs/provider → 4 parquets")
-    sg.add_argument("--url",        default="https://stage0b-attack-sim.onrender.com",
-                    help="Base URL of the Render deployment")
-    sg.add_argument("--apikey",     default=os.environ.get("STAGE_0B_API_KEY", ""),
-                    help="X-API-Key header value (or set STAGE_0B_API_KEY env var)")
-    sg.add_argument("--output",     default="./stage0b_outputs",
-                    help="Directory to write parquet files into")
-    sg.add_argument("--batch-size", type=int, default=25,
-                    help="Events per /generate_batch call (default 25)")
+    sg = sub.add_parser("selfgen", help="Call Render /generate_batch → 4 parquets locally")
+    sg.add_argument("--url",        default="https://stage0b-attack-sim.onrender.com")
+    sg.add_argument("--apikey",     default=os.environ.get("STAGE_0B_API_KEY", ""))
+    sg.add_argument("--output",     default="./stage0b_outputs")
+    sg.add_argument("--batch-size", type=int, default=25)
 
-    # ── batch (legacy — needs structured_events.parquet from Stage 0a) ────────
-    bt = sub.add_parser("batch",
-        help="(Legacy) Read structured_events.parquet and generate via Groq directly")
-    bt.add_argument("--input",  default="structured_events.parquet")
-    bt.add_argument("--output", default="./stage0b_outputs")
+    bt = sub.add_parser("batch", help="(Legacy) Read structured_events.parquet → generate via Groq")
+    bt.add_argument("--input",            default="structured_events.parquet")
+    bt.add_argument("--output",           default="./stage0b_outputs")
     bt.add_argument("--checkpoint-every", type=int, default=500)
 
-    # ── serve ─────────────────────────────────────────────────────────────────
-    sv = sub.add_parser("serve", help="Run the FastAPI server locally")
+    sv = sub.add_parser("serve", help="Run FastAPI server locally")
     sv.add_argument("--port", type=int, default=8000)
-
-    # ── backward-compat flat flags (old: python app.py --batch / --serve) ─────
-    parser.add_argument("--batch",  action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--input",  default="structured_events.parquet",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--output", default="./stage0b_outputs",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--checkpoint-every", type=int, default=500,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--serve",  action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--port",   type=int, default=8000, help=argparse.SUPPRESS)
-    parser.add_argument("--selfgen",action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--url",    default="https://stage0b-attack-sim.onrender.com",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--apikey", default=os.environ.get("STAGE_0B_API_KEY", ""),
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--batch-size", type=int, default=25, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # subcommand routing
     if args.cmd == "selfgen":
         run_selfgen(args.url, args.apikey, args.output, args.batch_size)
     elif args.cmd == "batch":
         run_batch(args.input, args.output, args.checkpoint_every)
     elif args.cmd == "serve":
-        import uvicorn
-        uvicorn.run("app:web", host="0.0.0.0", port=args.port, reload=False)
-    # flat-flag backward compat
-    elif getattr(args, "selfgen", False):
-        run_selfgen(args.url, args.apikey, args.output, args.batch_size)
-    elif getattr(args, "batch", False):
-        run_batch(args.input, args.output, args.checkpoint_every)
-    elif getattr(args, "serve", False):
         import uvicorn
         uvicorn.run("app:web", host="0.0.0.0", port=args.port, reload=False)
     else:
