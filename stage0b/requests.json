@@ -1,0 +1,549 @@
+
+request: Privilege escalation via AssumeRole (AWS)
+curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "provider": "AWS",
+  "action": "AssumeRole",
+  "entity_id": "user_john",
+  "entity_type": "User",
+  "target_id": "admin_role",
+  "source_ip": "185.220.101.45",
+  "region": "us-east-1",
+  "cloud_account": "123456789012",
+  "status": "Success",
+  "malicious": 1,
+  "attack_phase": "privilege_escalation",
+  "edge_id": "e_001",
+  "scenario_id": "sc_042",
+  "t": 3
+}' 
+
+  response: {
+  "log": {
+    "eventVersion": "1.08",
+    "eventTime": "2023-03-15T12:34:56Z",
+    "eventSource": "service.amazonaws.com",
+    "eventName": "AssumeRole",
+    "awsRegion": "us-east-1",
+    "sourceIPAddress": "185.220.101.45",
+    "userAgent": "Unknown",
+    "requestParameters": {
+      "roleArn": "arn:aws:iam::123456789012:role/admin_role"
+    },
+    "responseElements": {
+      "AssumedRoleUser": {
+        "Arn": "arn:aws:iam::123456789012:user/user_john",
+        "UserId": "AIDAEXAMPLE123456789012"
+      }
+    },
+    "errorCode": null,
+    "userIdentity": {
+      "type": "IAMUser",
+      "principalId": "AIDAEXAMPLE123456789012",
+      "arn": "arn:aws:iam::123456789012:user/user_john",
+      "accountId": "123456789012",
+      "userName": "user_john"
+    },
+    "requestID": "EXAMPLE123456789012",
+    "eventID": "EXAMPLE123456789012",
+    "readOnly": false,
+    "eventType": "AwsApiCall",
+    "recipientAccountId": "123456789012",
+    "_pipeline_meta": {
+      "edge_id": "e_001",
+      "scenario_id": "sc_042",
+      "t": 3,
+      "malicious": 1,
+      "attack_phase": "privilege_escalation",
+      "provider": "AWS"
+    }
+  },
+  "fallback": false
+}(venv)
+
+
+
+  request: benign s3 read
+  curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "provider": "AWS",
+  "action": "GetObject",
+  "entity_id": "user_alice",
+  "entity_type": "User",
+  "target_id": "prod-data-bucket",
+  "source_ip": "10.0.0.5",
+  "region": "us-west-2",
+  "cloud_account": "123456789012",
+  "status": "Success",
+  "malicious": 0,
+  "attack_phase": "benign",
+  "edge_id": "e_101",
+  "scenario_id": "sc_001",
+  "t": 1
+}' 
+
+  response: {
+  "log": {
+    "eventVersion": "1.08",
+    "eventTime": "2023-03-16T12:34:56Z",
+    "eventSource": "service.amazonaws.com",
+    "eventName": "GetObject",
+    "awsRegion": "us-west-2",
+    "sourceIPAddress": "10.0.0.5",
+    "userAgent": null,
+    "requestParameters": {
+      "bucketName": "prod-data-bucket",
+      "key": null
+    },
+    "responseElements": {
+      "x-amz-request-id": "1234567890",
+      "x-amz-id-2": "1234567890"
+    },
+    "errorCode": null,
+    "userIdentity": {
+      "type": "IAMUser",
+      "principalId": "user_alice",
+      "arn": "arn:aws:iam::123456789012:user/user_alice",
+      "accountId": "123456789012",
+      "userName": "user_alice"
+    },
+    "requestID": "1234567890",
+    "eventID": "1234567890",
+    "readOnly": true,
+    "eventType": "AwsApiCall",
+    "recipientAccountId": "123456789012",
+    "_pipeline_meta": {
+      "edge_id": "e_101",
+      "scenario_id": "sc_001",
+      "t": 1,
+      "malicious": 0,
+      "attack_phase": "benign",
+      "provider": "AWS"
+    }
+  },
+  "fallback": false
+}(venv)
+
+
+
+  request: Denied Api call
+  curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "provider": "AWS",
+  "action": "RunInstances",
+  "entity_id": "user_bob",
+  "entity_type": "User",
+  "target_id": "vm_009",
+  "source_ip": "198.51.100.23",
+  "region": "eu-west-1",
+  "cloud_account": "123456789012",
+  "status": "Failure",
+  "malicious": 1,
+  "attack_phase": "lateral_movement",
+  "edge_id": "e_055",
+  "scenario_id": "sc_007",
+  "t": 8
+}' 
+
+  response: {
+  "log": {
+    "eventVersion": "1.08",
+    "eventTime": "2023-03-16T12:34:56.789Z",
+    "eventSource": "service.amazonaws.com",
+    "eventName": "RunInstances",
+    "awsRegion": "eu-west-1",
+    "sourceIPAddress": "198.51.100.23",
+    "userAgent": "AWS SDK for Python",
+    "requestParameters": {
+      "instanceType": "t2.micro",
+      "imageId": "ami-12345678",
+      "minCount": 1,
+      "maxCount": 1
+    },
+    "responseElements": {
+      "instancesSet": {
+        "item": {
+          "instanceId": "i-12345678"
+        }
+      }
+    },
+    "errorCode": "InvalidParameterValue",
+    "userIdentity": {
+      "type": "IAMUser",
+      "principalId": "AIDA1234567890EXAMPLE",
+      "arn": "arn:aws:iam::123456789012:user/user_bob",
+      "accountId": "123456789012",
+      "userName": "user_bob"
+    },
+    "requestID": "EXAMPLE1234567890abcdef",
+    "eventID": "EXAMPLE1234567890abcdef",
+    "readOnly": false,
+    "eventType": "AwsApiCall",
+    "recipientAccountId": "123456789012",
+    "_pipeline_meta": {
+      "edge_id": "e_055",
+      "scenario_id": "sc_007",
+      "t": 8,
+      "malicious": 1,
+      "attack_phase": "lateral_movement",
+      "provider": "AWS"
+    }
+  },
+  "fallback": false
+}(venv) 
+
+
+  request: cross cloud pivots(Azure)
+  curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "provider": "Azure",
+  "action": "Microsoft.Compute/virtualMachines/start",
+  "entity_id": "john.doe@corp.com",
+  "entity_type": "User",
+  "target_id": "vm_005",
+  "source_ip": "185.220.101.45",
+  "region": "eastus",
+  "cloud_account": "sub-prod-001",
+  "status": "Success",
+  "malicious": 1,
+  "attack_phase": "cross_cloud_pivot",
+  "edge_id": "e_202",
+  "scenario_id": "sc_042",
+  "t": 5
+}'
+
+  response: {
+  "log": {
+    "time": "2023-01-01T00:00:00.0000000Z",
+    "resourceId": "/subscriptions/sub-prod-001/resourceGroups/Default-Compute-RG/providers/Microsoft.Compute/virtualMachines/vm_005",
+    "operationName": "Microsoft.Compute/virtualMachines/start",
+    "operationVersion": "1.0",
+    "category": "Administrative",
+    "resultType": "Succeeded",
+    "resultSignature": "200",
+    "durationMs": 1000,
+    "callerIpAddress": "185.220.101.45",
+    "correlationId": "00000000-0000-0000-0000-000000000000",
+    "identity": {
+      "authorization": {
+        "action": "Microsoft.Compute/virtualMachines/start",
+        "roleDefinitionId": "00000000-0000-0000-0000-000000000000",
+        "principalId": "john.doe@corp.com"
+      },
+      "claims": {
+        "name": "john.doe",
+        "upn": "john.doe@corp.com"
+      }
+    },
+    "level": "Information",
+    "location": "eastus",
+    "properties": {
+      "statusCode": 200,
+      "serviceRequestId": "service_request_001",
+      "resourceId": "/subscriptions/sub-prod-001/resourceGroups/Default-Compute-RG/providers/Microsoft.Compute/virtualMachines/vm_005"
+    },
+    "_pipeline_meta": {
+      "edge_id": "e_202",
+      "scenario_id": "sc_042",
+      "t": 5,
+      "malicious": 1,
+      "attack_phase": "cross_cloud_pivot",
+      "provider": "Azure"
+    }
+  },
+  "fallback": false
+}(venv)
+
+
+
+  request: cve exploitation(GCP)
+  curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "provider": "GCP",
+  "action": "compute.instances.setMetadata",
+  "entity_id": "mal-ip-node",
+  "entity_type": "IP",
+  "target_id": "vm_008",
+  "source_ip": "45.142.212.100",
+  "region": "us-central1",
+  "cloud_account": "my-gcp-project",
+  "status": "Success",
+  "malicious": 1,
+  "attack_phase": "cve_exploitation",
+  "edge_id": "e_303",
+  "scenario_id": "sc_042",
+  "t": 12
+}' 
+
+  response: {
+  "log": {
+    "logName": "projects/my-gcp-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "compute.googleapis.com/Instance",
+      "labels": {
+        "project_id": "my-gcp-project",
+        "zone": "us-central1-a",
+        "instance_id": "vm_008"
+      }
+    },
+    "timestamp": "2024-03-21T12:00:00.000Z",
+    "severity": "NOTICE",
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "status": {
+        "code": 0,
+        "message": ""
+      },
+      "authenticationInfo": {
+        "principalEmail": "unknown"
+      },
+      "requestMetadata": {
+        "callerIp": "45.142.212.100",
+        "callerSuppliedUserAgent": "unknown",
+        "requestAttributes": {
+          "instance": {
+            "service": "compute.googleapis.com"
+          }
+        }
+      },
+      "serviceName": "compute.googleapis.com",
+      "methodName": "compute.instances.setMetadata",
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "resource": "compute.googleapis.com/Instance",
+          "permission": "compute.instances.setMetadata"
+        }
+      ],
+      "resourceName": "projects/my-gcp-project/zones/us-central1-a/instances/vm_008"
+    },
+    "insertId": "e_303",
+    "receiveTimestamp": "2024-03-21T12:00:00.000Z",
+    "_pipeline_meta": {
+      "edge_id": "e_303",
+      "scenario_id": "sc_042",
+      "t": 12,
+      "malicious": 1,
+      "attack_phase": "cve_exploitation",
+      "provider": "GCP"
+    }
+  },
+  "fallback": false
+}(venv)
+
+
+request: batch test (all 3 providers ta once)
+  curl -s -X POST https: //stage0b-attack-sim.onrender.com/generate_batch \
+  -H "X-API-Key: cb84a4ee6be7b36b0279fd33d2d5b66e1b148e82da15c81fd6a3d13cd51ac309" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "events": [
+    {
+      "provider": "AWS",
+      "action": "AssumeRole",
+      "entity_id": "user_john",
+      "entity_type": "User",
+      "target_id": "admin_role",
+      "source_ip": "185.220.101.45",
+      "region": "us-east-1",
+      "cloud_account": "123456789012",
+      "status": "Success",
+      "malicious": 1,
+      "attack_phase": "privilege_escalation",
+      "edge_id": "e_001",
+      "scenario_id": "sc_042",
+      "t": 3
+    },
+    {
+      "provider": "Azure",
+      "action": "Microsoft.Compute/virtualMachines/start",
+      "entity_id": "john.doe@corp.com",
+      "entity_type": "User",
+      "target_id": "vm_005",
+      "source_ip": "185.220.101.45",
+      "region": "eastus",
+      "cloud_account": "sub-prod-001",
+      "status": "Success",
+      "malicious": 1,
+      "attack_phase": "cross_cloud_pivot",
+      "edge_id": "e_202",
+      "scenario_id": "sc_042",
+      "t": 5
+    },
+    {
+      "provider": "GCP",
+      "action": "compute.instances.setMetadata",
+      "entity_id": "mal-ip-node",
+      "entity_type": "IP",
+      "target_id": "vm_008",
+      "source_ip": "45.142.212.100",
+      "region": "us-central1",
+      "cloud_account": "my-gcp-project",
+      "status": "Success",
+      "malicious": 1,
+      "attack_phase": "cve_exploitation",
+      "edge_id": "e_303",
+      "scenario_id": "sc_042",
+      "t": 12
+    }
+  ]
+}' 
+
+  response: {
+  "total": 3,
+  "successful": 3,
+  "fallback_count": 0,
+  "fallback_rate": 0.0,
+  "results": [
+    {
+      "log": {
+        "eventVersion": "1.08",
+        "eventTime": "2023-03-15T12:34:56.789Z",
+        "eventSource": "service.amazonaws.com",
+        "eventName": "AssumeRole",
+        "awsRegion": "us-east-1",
+        "sourceIPAddress": "185.220.101.45",
+        "userAgent": null,
+        "requestParameters": {
+          "roleArn": "arn:aws:iam::123456789012:role/admin_role",
+          "roleSessionName": "user_john"
+        },
+        "responseElements": {
+          "AssumedRoleUser": {
+            "Arn": "arn:aws:iam::123456789012:role/admin_role",
+            "UserId": "AIDAJ5EXAMPLE"
+          }
+        },
+        "errorCode": null,
+        "userIdentity": {
+          "type": "IAMUser",
+          "principalId": "AIDAJ5EXAMPLE",
+          "arn": "arn:aws:iam::123456789012:user/user_john",
+          "accountId": "123456789012",
+          "userName": "user_john"
+        },
+        "requestID": "EXAMPLE1234567890",
+        "eventID": "EXAMPLE1234567890",
+        "readOnly": false,
+        "eventType": "AwsApiCall",
+        "recipientAccountId": "123456789012",
+        "_pipeline_meta": {
+          "edge_id": "e_001",
+          "scenario_id": "sc_042",
+          "t": 3,
+          "malicious": 1,
+          "attack_phase": "privilege_escalation",
+          "provider": "AWS"
+        }
+      },
+      "fallback": false
+    },
+    {
+      "log": {
+        "time": "2023-01-01T00:00:00.0000000Z",
+        "resourceId": "/subscriptions/sub-prod-001/resourceGroups/Default-Compute-RG/providers/Microsoft.Compute/virtualMachines/vm_005",
+        "operationName": "Microsoft.Compute/virtualMachines/start",
+        "operationVersion": "1.0",
+        "category": "Administrative",
+        "resultType": "Succeeded",
+        "resultSignature": "200",
+        "durationMs": 1000,
+        "callerIpAddress": "185.220.101.45",
+        "correlationId": "00000000-0000-0000-0000-000000000000",
+        "identity": {
+          "authorization": {
+            "action": "Microsoft.Compute/virtualMachines/start",
+            "roleDefinitionId": "00000000-0000-0000-0000-000000000000"
+          },
+          "claims": {
+            "name": "john.doe",
+            "upn": "john.doe@corp.com"
+          }
+        },
+        "level": "Information",
+        "location": "eastus",
+        "properties": {
+          "statusCode": 200,
+          "serviceRequestId": "service_request_001",
+          "resourceId": "/subscriptions/sub-prod-001/resourceGroups/Default-Compute-RG/providers/Microsoft.Compute/virtualMachines/vm_005"
+        },
+        "_pipeline_meta": {
+          "edge_id": "e_202",
+          "scenario_id": "sc_042",
+          "t": 5,
+          "malicious": 1,
+          "attack_phase": "cross_cloud_pivot",
+          "provider": "Azure"
+        }
+      },
+      "fallback": false
+    },
+    {
+      "log": {
+        "logName": "projects/my-gcp-project/logs/cloudaudit.googleapis.com%2Factivity",
+        "resource": {
+          "type": "compute.googleapis.com/Instance",
+          "labels": {
+            "project_id": "my-gcp-project",
+            "zone": "us-central1-a",
+            "instance_id": "vm_008"
+          }
+        },
+        "timestamp": "2024-03-15T10:00:00.000Z",
+        "severity": "NOTICE",
+        "protoPayload": {
+          "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+          "status": {
+            "code": 0,
+            "message": ""
+          },
+          "authenticationInfo": {
+            "principalEmail": "unknown"
+          },
+          "requestMetadata": {
+            "callerIp": "45.142.212.100",
+            "callerSuppliedUserAgent": "unknown",
+            "requestAttributes": {
+              "instance": {
+                "instanceId": "vm_008"
+              }
+            }
+          },
+          "serviceName": "compute.googleapis.com",
+          "methodName": "compute.instances.setMetadata",
+          "authorizationInfo": [
+            {
+              "granted": true,
+              "resource": "compute.googleapis.com/Instance",
+              "permission": "compute.instances.setMetadata"
+            }
+          ],
+          "resourceName": "projects/my-gcp-project/zones/us-central1-a/instances/vm_008"
+        },
+        "insertId": "e_303",
+        "receiveTimestamp": "2024-03-15T10:00:00.000Z",
+        "_pipeline_meta": {
+          "edge_id": "e_303",
+          "scenario_id": "sc_042",
+          "t": 12,
+          "malicious": 1,
+          "attack_phase": "cve_exploitation",
+          "provider": "GCP"
+        }
+      },
+      "fallback": false
+    }
+  ]
+}(venv)
+
+
