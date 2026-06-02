@@ -1990,6 +1990,48 @@ def generate_batch(req: BatchRequest, _: str = Depends(_validate)):
     }
 
 
+@web.post("/generate_batch_lot")
+def generate_batch_lot(_: str = Depends(_validate)):
+    """
+    Generates 900 provider-native logs (300 x AWS, 300 x Azure, 300 x GCP)
+    using the built-in event corpus.  No request body needed — just POST to
+    this endpoint and it returns all 900 results grouped by provider.
+
+    Response shape:
+    {
+      "total": 900,
+      "fallback_count": <int>,
+      "fallback_rate": <float>,
+      "providers": {
+        "AWS":   { "count": 300, "results": [ ... ] },
+        "Azure": { "count": 300, "results": [ ... ] },
+        "GCP":   { "count": 300, "results": [ ... ] }
+      }
+    }
+    """
+    events    = _build_event_corpus()   # 900 structured events
+    fallbacks = 0
+    by_prov   = {"AWS": [], "Azure": [], "GCP": []}
+
+    for ev in events:
+        r = generate_one(ev)
+        if r["fallback"]:
+            fallbacks += 1
+        by_prov[ev["provider"]].append(r)
+        time.sleep(REQUEST_DELAY)
+
+    total = sum(len(v) for v in by_prov.values())
+    return {
+        "total":          total,
+        "fallback_count": fallbacks,
+        "fallback_rate":  round(fallbacks / total, 3) if total else 0,
+        "providers": {
+            prov: {"count": len(results), "results": results}
+            for prov, results in by_prov.items()
+        },
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BATCH GENERATION SCRIPT  (run directly: python app.py --batch …)
 # Reads structured_events.parquet from Stage 0a, writes 4 parquets for Stage 1
